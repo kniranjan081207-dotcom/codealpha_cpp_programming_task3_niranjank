@@ -1,0 +1,474 @@
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace std;
+namespace fs = std::filesystem;
+
+using Money = long long;  
+
+const string CURRENCY = "Rs. ";
+const Money MAX_AMOUNT = 100000000000LL;      
+const Money MAX_BALANCE = 1000000000000000LL; 
+const char* DATA_FILE = "bank_data.txt";
+
+
+string formatMoney(Money cents) {
+    bool neg = cents < 0;
+    if (neg) cents = -cents;
+    ostringstream os;
+    os << (neg ? "-" : "") << CURRENCY << cents / 100 << "." << setw(2) << setfill('0') << cents % 100;
+    return os.str();
+}
+
+string formatTime(time_t t) {
+    char buf[32];
+    tm* lt = localtime(&t);
+    strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", lt);
+    return buf;
+}
+
+
+optional<Money> parseMoney(const string& s, bool allowZero = false) {
+    if (s.empty()) return nullopt;
+    size_t dot = s.find('.');
+    string whole = s.substr(0, dot);
+    string frac = (dot == string::npos) ? "" : s.substr(dot + 1);
+    if (whole.empty() && frac.empty()) return nullopt;
+    if (whole.size() > 10 || frac.size() > 2) return nullopt;
+    for (char c : whole + frac)
+        if (!isdigit(static_cast<unsigned char>(c))) return nullopt;
+    Money w = whole.empty() ? 0 : stoll(whole);
+    Money f = frac.empty() ? 0 : stoll(frac) * (frac.size() == 1 ? 10 : 1);
+    Money total = w * 100 + f;
+    if (total == 0 && !allowZero) return nullopt;
+    if (total > MAX_AMOUNT) return nullopt;
+    return total;
+}
+
+vector<string> split(const string& s, char delim) {
+    vector<string> out;
+    string tok;
+    stringstream ss(s);
+    while (getline(ss, tok, delim)) out.push_back(tok);
+    if (!s.empty() && s.back() == delim) out.push_back("");
+    return out;
+}
+
+struct Result {
+    bool ok;
+    string message;
+};
+
+
+enum class TxType { Deposit = 0, Withdrawal = 1, TransferIn = 2, TransferOut = 3 };
+
+string txTypeName(TxType t) {
+    switch (t) {
+        case TxType::Deposit: return "Deposit";
+        case TxType::Withdrawal: return "Withdrawal";
+        case TxType::TransferIn: return "Transfer In";
+        case TxType::TransferOut: return "Transfer Out";
+    }
+    return "?";
+}
+
+class Transaction {
+public:
+    long long id;
+    TxType type;
+    Money amount;            
+    Money balanceAfter;
+    time_t when;
+    long long counterparty; 
+
+    bool isCredit() const { return type == TxType::Deposit || type == TxType::TransferIn; }
+
+    string details() const {
+        if (type == TxType::TransferOut) return "To account " + to_string(counterparty);
+        if (type == TxType::TransferIn) return "From account " + to_string(counterparty);
+        return "-";
+    }
+};
+
+
+class Account {
+    long long number_;
+    long long ownerId_;
+    Money balance_ = 0;
+    vector<Transaction> history_;
+
+public:
+    Account(long long number, long long ownerId, Money balance = 0)
+        : number_(number), ownerId_(ownerId), balance_(balance) {}
+
+    long long number() const { return number_; }
+    long long ownerId() const { return ownerId_; }
+    Money balance() const { return balance_; }
+    const vector<Transaction>& history() const { return history_; }
+
+    bool canCredit(Money amount) const { return balance_ + amount <= MAX_BALANCE; }
+    bool canDebit(Money amount) const { return amount <= balance_; }
+
+
+    void credit(TxType type, Money amount, long long txId, long long counterparty = 0) {
+        balance_ += amount;
+        history_.push_back({txId, type, amount, balance_, time(nullptr), counterparty});
+    }
+    void debit(TxType type, Money amount, long long txId, long long counterparty = 0) {
+        balance_ -= amount;
+        history_.push_back({txId, type, amount, balance_, time(nullptr), counterparty});
+    }
+
+    void restore(const Transaction& t) { history_.push_back(t); }  // used when loading from file
+};
+
+class Customer {
+    long long id_;
+    string name_;
+    string phone_;
+    vector<long long> accounts_;
+
+public:
+    Customer(long long id, string name, string phone) : id_(id), name_(move(name)), phone_(move(phone)) {}
+    long long id() const { return id_; }
+    const string& name() const { return name_; }
+    const string& phone() const { return phone_; }
+    const vector<long long>& accounts() const { return accounts_; }
+    void addAccount(long long number) { accounts_.push_back(number); }
+};
+
+class Bank {
+    map<long long, Customer> customers_;
+    map<long long, Account> accounts_;
+    long long nextCustomerId_ = 1;
+    long long nextAccountNo_ = 1000001;
+    long long nextTxId_ = 1;
+    string path_;
+
+    Result done(const string& msg) {
+        if (!save()) return {true, msg + " (Warning: could not save data to disk.)"};
+        return {true, msg};
+    }
+
+public:
+    explicit Bank(string path) : path_(move(path)) {}
+
+    const Customer* findCustomer(long long id) const {
+        auto it = customers_.find(id);
+        return it == customers_.end() ? nullptr : &it->second;
+    }
+    const Account* findAccount(long long no) const {
+        auto it = accounts_.find(no);
+        return it == accounts_.end() ? nullptr : &it->second;
+    }
+
+    Result createCustomer(const string& name, const string& phone, long long& idOut) {
+        if (name.empty() || name.size() > 50) return {false, "Name must be 1-50 characters."};
+        if (name.find('|') != string::npos) return {false, "Name must not contain '|'."};
+        if (phone.size() < 7 || phone.size() > 15 ||
+            !all_of(phone.begin(), phone.end(), [](unsigned char c) { return isdigit(c); }))
+            return {false, "Phone must be 7-15 digits."};
+        idOut = nextCustomerId_++;
+        customers_.emplace(idOut, Customer(idOut, name, phone));
+        return done("Customer created. Customer ID: " + to_string(idOut));
+    }
+
+    Result openAccount(long long customerId, Money initialDeposit, long long& accountOut) {
+        auto cit = customers_.find(customerId);
+        if (cit == customers_.end()) return {false, "No customer with ID " + to_string(customerId) + "."};
+        accountOut = nextAccountNo_++;
+        auto [it, ok] = accounts_.emplace(accountOut, Account(accountOut, customerId));
+        (void)ok;
+        cit->second.addAccount(accountOut);
+        if (initialDeposit > 0) it->second.credit(TxType::Deposit, initialDeposit, nextTxId_++);
+        return done("Account opened. Account number: " + to_string(accountOut));
+    }
+
+   
+    Result deposit(long long accountNo, Money amount) {
+        auto it = accounts_.find(accountNo);
+        if (it == accounts_.end()) return {false, "Account " + to_string(accountNo) + " not found."};
+        if (!it->second.canCredit(amount)) return {false, "Deposit would exceed the maximum balance."};
+        it->second.credit(TxType::Deposit, amount, nextTxId_++);
+        return done("Deposited " + formatMoney(amount) + ". New balance: " + formatMoney(it->second.balance()));
+    }
+
+    Result withdraw(long long customerId, long long accountNo, Money amount) {
+        auto it = accounts_.find(accountNo);
+        if (it == accounts_.end() || it->second.ownerId() != customerId)
+            return {false, "Account not found for this customer."};
+        if (!it->second.canDebit(amount))
+            return {false, "Insufficient funds. Available balance: " + formatMoney(it->second.balance())};
+        it->second.debit(TxType::Withdrawal, amount, nextTxId_++);
+        return done("Withdrew " + formatMoney(amount) + ". New balance: " + formatMoney(it->second.balance()));
+    }
+
+    Result transfer(long long customerId, long long fromNo, long long toNo, Money amount) {
+        if (fromNo == toNo) return {false, "Cannot transfer to the same account."};
+        auto from = accounts_.find(fromNo);
+        if (from == accounts_.end() || from->second.ownerId() != customerId)
+            return {false, "Source account not found for this customer."};
+        auto to = accounts_.find(toNo);
+        if (to == accounts_.end()) return {false, "Destination account " + to_string(toNo) + " not found."};
+        if (!from->second.canDebit(amount))
+            return {false, "Insufficient funds. Available balance: " + formatMoney(from->second.balance())};
+        if (!to->second.canCredit(amount)) return {false, "Transfer would exceed the destination's maximum balance."};
+        // All checks passed, so both sides are applied together.
+        long long txOut = nextTxId_++, txIn = nextTxId_++;
+        from->second.debit(TxType::TransferOut, amount, txOut, toNo);
+        to->second.credit(TxType::TransferIn, amount, txIn, fromNo);
+        return done("Transferred " + formatMoney(amount) + " to account " + to_string(toNo) +
+                    ". New balance: " + formatMoney(from->second.balance()));
+    }
+
+    bool save() const {
+        string tmp = path_ + ".tmp";
+        {
+            ofstream out(tmp, ios::trunc);
+            if (!out) return false;
+            for (const auto& [id, c] : customers_) out << "C|" << id << "|" << c.name() << "|" << c.phone() << "\n";
+            for (const auto& [no, a] : accounts_) out << "A|" << no << "|" << a.ownerId() << "|" << a.balance() << "\n";
+            for (const auto& [no, a] : accounts_)
+                for (const auto& t : a.history())
+                    out << "T|" << no << "|" << t.id << "|" << static_cast<int>(t.type) << "|" << t.amount << "|"
+                        << t.balanceAfter << "|" << static_cast<long long>(t.when) << "|" << t.counterparty << "\n";
+            if (!out) return false;
+        }
+        error_code ec;
+        fs::rename(tmp, path_, ec);
+        return !ec;
+    }
+
+
+    bool load(string& err) {
+        ifstream in(path_);
+        if (!in) return true;  
+        string line;
+        int lineNo = 0;
+        try {
+            while (getline(in, line)) {
+                ++lineNo;
+                if (line.empty()) continue;
+                auto p = split(line, '|');
+                if (p[0] == "C" && p.size() == 4) {
+                    long long id = stoll(p[1]);
+                    customers_.emplace(id, Customer(id, p[2], p[3]));
+                    nextCustomerId_ = max(nextCustomerId_, id + 1);
+                } else if (p[0] == "A" && p.size() == 4) {
+                    long long no = stoll(p[1]), owner = stoll(p[2]);
+                    auto cit = customers_.find(owner);
+                    if (cit == customers_.end()) throw runtime_error("account without customer");
+                    accounts_.emplace(no, Account(no, owner, stoll(p[3])));
+                    cit->second.addAccount(no);
+                    nextAccountNo_ = max(nextAccountNo_, no + 1);
+                } else if (p[0] == "T" && p.size() == 8) {
+                    auto ait = accounts_.find(stoll(p[1]));
+                    if (ait == accounts_.end()) throw runtime_error("transaction without account");
+                    int type = stoi(p[3]);
+                    if (type < 0 || type > 3) throw runtime_error("bad transaction type");
+                    Transaction t{stoll(p[2]), static_cast<TxType>(type), stoll(p[4]), stoll(p[5]),
+                                  static_cast<time_t>(stoll(p[6])), stoll(p[7])};
+                    ait->second.restore(t);
+                    nextTxId_ = max(nextTxId_, t.id + 1);
+                } else {
+                    throw runtime_error("unrecognised line");
+                }
+            }
+        } catch (const exception& e) {
+            err = string("Data file is damaged at line ") + to_string(lineNo) + " (" + e.what() + ").";
+            return false;
+        }
+        return true;
+    }
+};
+
+void printAccountInfo(const Bank& bank, const Account& a) {
+    const Customer* c = bank.findCustomer(a.ownerId());
+    cout << "\n--- Account Information ---\n"
+         << "Account number : " << a.number() << "\n"
+         << "Account holder : " << (c ? c->name() : "?") << " (Customer ID " << a.ownerId() << ")\n"
+         << "Balance        : " << formatMoney(a.balance()) << "\n"
+         << "Transactions   : " << a.history().size() << "\n";
+}
+
+void printTransactions(const Account& a, size_t count) {
+    const auto& h = a.history();
+    if (h.empty()) { cout << "No transactions yet.\n"; return; }
+    size_t shown = min(count, h.size());
+    cout << "\n--- Last " << shown << " transaction(s) for account " << a.number() << " (newest first) ---\n";
+    cout << left << setw(6) << "ID" << setw(18) << "Date/Time" << setw(14) << "Type" << right << setw(16)
+         << "Amount" << setw(16) << "Balance" << "  " << left << "Details\n";
+    for (size_t i = 0; i < shown; ++i) {
+        const Transaction& t = h[h.size() - 1 - i];
+        string amt = (t.isCredit() ? "+" : "-") + formatMoney(t.amount);
+        cout << left << setw(6) << t.id << setw(18) << formatTime(t.when) << setw(14) << txTypeName(t.type)
+             << right << setw(16) << amt << setw(16) << formatMoney(t.balanceAfter) << "  " << left
+             << t.details() << "\n";
+    }
+}
+
+void printCustomer(const Bank& bank, const Customer& c) {
+    cout << "\n--- Customer " << c.id() << ": " << c.name() << " (phone " << c.phone() << ") ---\n";
+    if (c.accounts().empty()) { cout << "No accounts yet.\n"; return; }
+    for (long long no : c.accounts()) {
+        const Account* a = bank.findAccount(no);
+        if (a) cout << "  Account " << no << "   balance " << formatMoney(a->balance()) << "\n";
+    }
+}
+
+
+string readLine(const string& prompt) {
+    cout << prompt << flush;
+    string s;
+    if (!getline(cin, s)) { cout << "\nInput ended. Goodbye.\n"; exit(0); }
+    size_t b = s.find_first_not_of(" \t\r");
+    size_t e = s.find_last_not_of(" \t\r");
+    return b == string::npos ? "" : s.substr(b, e - b + 1);
+}
+
+optional<long long> readId(const string& prompt) {
+    string s = readLine(prompt);
+    if (s.empty() || s.size() > 12 || !all_of(s.begin(), s.end(), [](unsigned char c) { return isdigit(c); })) {
+        cout << "Error: please enter a valid number.\n";
+        return nullopt;
+    }
+    return stoll(s);
+}
+
+optional<Money> readMoney(const string& prompt, bool allowZero = false) {
+    auto m = parseMoney(readLine(prompt), allowZero);
+    if (!m) cout << "Error: enter a valid positive amount with at most 2 decimals (max " << formatMoney(MAX_AMOUNT) << ").\n";
+    return m;
+}
+
+void report(const Result& r) { cout << (r.ok ? "Success: " : "Error: ") << r.message << "\n"; }
+
+void uiCreateCustomer(Bank& bank) {
+    cout << "\n--- New Customer ---\n";
+    string name = readLine("Full name: ");
+    string phone = readLine("Phone number: ");
+    long long id = 0;
+    report(bank.createCustomer(name, phone, id));
+}
+
+void uiOpenAccount(Bank& bank) {
+    cout << "\n--- Open Account ---\n";
+    auto cid = readId("Customer ID: ");
+    if (!cid) return;
+    if (!bank.findCustomer(*cid)) { cout << "Error: no customer with ID " << *cid << ".\n"; return; }
+    auto dep = readMoney("Opening deposit (0 for none): ", true);
+    if (!dep) return;
+    long long acct = 0;
+    report(bank.openAccount(*cid, *dep, acct));
+}
+
+void uiDeposit(Bank& bank) {
+    cout << "\n--- Deposit ---\n";
+    auto acct = readId("Account number: ");
+    if (!acct) return;
+    auto amt = readMoney("Amount to deposit: ");
+    if (!amt) return;
+    report(bank.deposit(*acct, *amt));
+}
+
+void uiWithdraw(Bank& bank) {
+    cout << "\n--- Withdraw ---\n";
+    auto cid = readId("Customer ID: ");
+    if (!cid) return;
+    auto acct = readId("Account number: ");
+    if (!acct) return;
+    auto amt = readMoney("Amount to withdraw: ");
+    if (!amt) return;
+    report(bank.withdraw(*cid, *acct, *amt));
+}
+
+void uiTransfer(Bank& bank) {
+    cout << "\n--- Transfer Funds ---\n";
+    auto cid = readId("Your customer ID: ");
+    if (!cid) return;
+    auto from = readId("From account number: ");
+    if (!from) return;
+    auto to = readId("To account number: ");
+    if (!to) return;
+    auto amt = readMoney("Amount to transfer: ");
+    if (!amt) return;
+    report(bank.transfer(*cid, *from, *to, *amt));
+}
+
+// Viewing requires the owner's customer ID as well as the account number.
+const Account* askOwnedAccount(const Bank& bank) {
+    auto cid = readId("Customer ID: ");
+    if (!cid) return nullptr;
+    auto acct = readId("Account number: ");
+    if (!acct) return nullptr;
+    const Account* a = bank.findAccount(*acct);
+    if (!a || a->ownerId() != *cid) { cout << "Error: account not found for this customer.\n"; return nullptr; }
+    return a;
+}
+
+void uiAccountInfo(const Bank& bank) {
+    const Account* a = askOwnedAccount(bank);
+    if (!a) return;
+    printAccountInfo(bank, *a);
+    printTransactions(*a, 5);
+}
+
+void uiTransactions(const Bank& bank) {
+    const Account* a = askOwnedAccount(bank);
+    if (!a) return;
+    string n = readLine("How many recent transactions? (default 5): ");
+    size_t count = 5;
+    if (!n.empty()) {
+        if (n.size() > 6 || !all_of(n.begin(), n.end(), [](unsigned char c) { return isdigit(c); }) || stoul(n) == 0) {
+            cout << "Error: enter a positive whole number.\n";
+            return;
+        }
+        count = stoul(n);
+    }
+    printTransactions(*a, count);
+}
+
+void uiCustomerSummary(const Bank& bank) {
+    auto cid = readId("Customer ID: ");
+    if (!cid) return;
+    const Customer* c = bank.findCustomer(*cid);
+    if (!c) { cout << "Error: no customer with ID " << *cid << ".\n"; return; }
+    printCustomer(bank, *c);
+}
+
+int main() {
+    Bank bank(DATA_FILE);
+    string err;
+    if (!bank.load(err)) {
+        cerr << err << "\nRefusing to start so the existing data is not overwritten.\n";
+        return 1;
+    }
+
+    while (true) {
+        cout << "\n===== BANKING SYSTEM =====\n"
+             << "1. Create customer\n2. Open account\n3. Deposit\n4. Withdraw\n5. Transfer funds\n"
+             << "6. Account information\n7. Recent transactions\n8. Customer summary\n9. Exit\n";
+        string choice = readLine("Choose an option: ");
+        if (choice == "1") uiCreateCustomer(bank);
+        else if (choice == "2") uiOpenAccount(bank);
+        else if (choice == "3") uiDeposit(bank);
+        else if (choice == "4") uiWithdraw(bank);
+        else if (choice == "5") uiTransfer(bank);
+        else if (choice == "6") uiAccountInfo(bank);
+        else if (choice == "7") uiTransactions(bank);
+        else if (choice == "8") uiCustomerSummary(bank);
+        else if (choice == "9") { cout << "Thank you for banking with us. Goodbye.\n"; return 0; }
+        else cout << "Error: please enter a number from 1 to 9.\n";
+    }
+}
